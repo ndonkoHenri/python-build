@@ -195,7 +195,7 @@ jobs:
     runs-on: ubuntu-latest
     # Only publish GitHub release assets from the main branch; other branches still
     # build (and upload per-job artifacts) but don't touch releases.
-    if: github.ref == 'refs/heads/main'
+    # if: github.ref == 'refs/heads/main'
     needs:
       - build-darwin
       - build-android
