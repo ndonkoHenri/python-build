@@ -48,53 +48,59 @@ def find_sysconfigdata(prefix: Path) -> list[Path]:
 
 
 def replace_libpython_stub(prefix: Path) -> None:
-    """Replace `<prefix>/lib/libpython3.so` with a GNU ld linker script.
+    """Replace the `<prefix>/lib/libpython{3,}.so` stubs with GNU ld scripts.
 
-    abi3-stable extension wheels link against `-lpython3`. The linker
-    resolves that to `libpython3.so` in the sysroot. On a vanilla
-    install `libpython3.so` is a symlink to `libpython3.<version>.so`,
-    and some linker pipelines record the symlink filename
-    (`libpython3.so`) into the wheel's `DT_NEEDED` instead of the
-    target's `SONAME`. When the wheel then ships to a device that only
-    carries `libpython3.<version>.so`, `dlopen` fails to resolve
-    `libpython3.so` and crashes.
+    Extension wheels reach libpython by one of two unversioned names:
+      - abi3-stable wheels link `-lpython3`                  -> `libpython3.so`
+      - some meson builds (e.g. scipy) emit a bare `-lpython` -> `libpython.so`
 
-    A linker script `INPUT ( -lpython3.<version> )` makes the linker
-    resolve straight through to the versioned library at link time
-    without going via a filename that could leak into `DT_NEEDED`.
+    On a vanilla install those are symlinks to `libpython3.<version>.so`, and
+    some linker pipelines record the *symlink* filename into the wheel's
+    `DT_NEEDED` instead of the target's `SONAME`; the wheel then `dlopen`-fails
+    on a device that only carries the versioned library. A linker script
+    `INPUT ( -lpython3.<version> )` makes ld resolve straight through to the
+    versioned library at link time without leaking a bare filename.
 
-    Idempotent: if `libpython3.so` is already a symlink pointing at the
-    correct versioned target, leave it alone (consumers that work
-    against that symlink keep working); otherwise replace it.
+    `libpython3.so` is only retargeted if the install already shipped it (don't
+    invent an abi3 stub where there was none). `libpython.so` is created
+    unconditionally: a vanilla install ships no such file, but Android's
+    `--no-undefined` link needs it for bare-`-lpython` consumers like scipy.
+
+    Idempotent: a name already pointing at the correct versioned target via
+    symlink is left alone.
 
     Args:
         prefix: A Python install prefix (the dir containing `lib/`).
     """
     lib_dir = prefix / "lib"
-    libpython = lib_dir / "libpython3.so"
-    # `libpython3.X.so` is the canonical versioned name; pick the first
-    # match (typically there's only one — the install-tree libpython).
+    # `libpython3.X.so` is the canonical versioned name; pick the first match
+    # (typically there's only one — the install-tree libpython).
     versioned = sorted(lib_dir.glob("libpython3.[0-9]*.so"))
-    if not libpython.exists() or not versioned:
-        # Nothing to retarget. Tree was built without a libpython3.so
-        # stub, or the versioned library never landed — in either case
-        # there's no consumer-visible breakage to fix.
+    if not versioned:
+        # The versioned library never landed — nothing to point at.
         return
 
-    target = versioned[0].name
-    # Already a symlink pointing at the right versioned target — leave
-    # it alone so consumers that work against that symlink keep working.
-    if libpython.is_symlink() and os.readlink(libpython) == target:
-        return
+    target = versioned[0].name  # e.g. libpython3.12.so
+    # `INPUT ( -lpython3.X )` tells ld to resolve through to libpython3.X.so
+    # without recording an unversioned name into the consumer's `DT_NEEDED`.
+    ld_script = f"INPUT ( -l{target.removeprefix('lib').removesuffix('.so')} )\n"
 
-    # Replace whatever's at libpython3.so (stale symlink, regular file from a
-    # previous run, …) with a one-line ld linker script. `INPUT ( -lpython3.X )`
-    # tells ld to resolve through to libpython3.X.so without recording the bare
-    # `libpython3.so` name into the consumer's `DT_NEEDED`.
-    libpython.unlink()
-    libpython.write_text(
-        f"INPUT ( -l{target.removeprefix('lib').removesuffix('.so')} )\n"
-    )
+    def write_ld_script(name: str, *, only_if_present: bool) -> None:
+        path = lib_dir / name
+        if only_if_present and not (path.exists() or path.is_symlink()):
+            return
+        # Already a symlink pointing at the right versioned target — leave it
+        # alone so consumers that work against that symlink keep working.
+        if path.is_symlink() and os.readlink(path) == target:
+            return
+        if path.exists() or path.is_symlink():
+            path.unlink()
+        path.write_text(ld_script)
+
+    # abi3 `-lpython3` consumers — retarget the existing stub.
+    write_ld_script("libpython3.so", only_if_present=True)
+    # bare `-lpython` consumers (scipy's meson) — create even if absent.
+    write_ld_script("libpython.so", only_if_present=False)
 
 
 def append_relocation_block(
